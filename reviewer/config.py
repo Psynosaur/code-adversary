@@ -192,3 +192,8 @@ DIFF_CHUNK_MAX_CHARS = 24_000
 
 # ── Usage Logging ────────────────────────────────────────────────────────────
 USAGE_LOG_PATH = "usage.log"
+
+# ── Audit Logging ────────────────────────────────────────────────────────────
+# One JSON file per LLM invocation — captures full prompts, responses, and metadata.
+# Files named: {timestamp}_{tool}.json
+AUDIT_LOG_DIR = "audit"

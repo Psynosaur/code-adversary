@@ -193,3 +193,99 @@ def build_challenge_decision_message(
     )
 
     return "\n".join(parts)
+
+
+# ── review_files ─────────────────────────────────────────────────────────────
+
+REVIEW_FILES_SYSTEM = f"""{_PERSONA_PREAMBLE}
+
+You are reviewing source files in their entirety (not a diff). You receive:
+1. One or more source files with their paths and full contents
+2. Automated regex findings (a deterministic first pass — treat these as confirmed facts, do not repeat them)
+3. Optional memory context (prior decisions, preferences, architecture notes)
+4. Optional focus areas to prioritize
+
+Your job is to find what the regex missed — review the code as a whole:
+- Logic errors, off-by-one, race conditions, null/undefined paths
+- Missing edge cases (empty input, huge input, concurrent access, unicode, timezone)
+- Error handling gaps (what happens when this fails?)
+- Security issues beyond simple pattern matching
+- Design problems (coupling, god objects, leaky abstractions, wrong level of abstraction)
+- Inconsistencies with the stated architecture or prior decisions from memory context
+- Missing tests or untestable code
+- Performance issues (N+1 queries, unbounded growth, blocking I/O in async context)
+- Cross-file concerns: inconsistent patterns, duplicated logic, broken contracts between modules
+
+For each finding, assign a severity:
+- critical: Must fix. Correctness bug, security hole, data loss risk.
+- warning: Should fix. Reliability, maintainability, edge case that will bite eventually.
+- suggestion: Consider. Style, naming, minor improvement.
+
+Respond with this exact JSON structure:
+{{
+  "findings": [
+    {{
+      "severity": "critical|warning|suggestion",
+      "category": "correctness|security|error_handling|edge_cases|naming|consistency|performance|complexity|testing|architecture|documentation|type_safety|concurrency|resource_management",
+      "title": "Short title",
+      "description": "Detailed explanation of the issue and why it matters",
+      "file_path": "path/to/file.py or null",
+      "line_range": "42 or 10-20 or null",
+      "code_snippet": "relevant code or null",
+      "suggestion": "how to fix it or null"
+    }}
+  ],
+  "summary": "One paragraph overall assessment"
+}}"""
+
+
+def build_review_files_message(
+    files: list[dict[str, str]],
+    regex_findings_json: str,
+    memories_json: str | None = None,
+    focus_areas: str | None = None,
+) -> str:
+    """Build the user message for review_files.
+
+    Args:
+        files: List of dicts with "path" and "content" keys.
+        regex_findings_json: JSON string of automated regex findings.
+        memories_json: Optional JSON string of memory context.
+        focus_areas: Optional comma-separated focus areas.
+    """
+    parts = ["## Source Files\n"]
+
+    for f in files:
+        # Infer language from extension for syntax highlighting
+        ext = f["path"].rsplit(".", 1)[-1] if "." in f["path"] else ""
+        lang = {
+            "py": "python",
+            "ts": "typescript",
+            "js": "javascript",
+            "rs": "rust",
+            "go": "go",
+            "java": "java",
+            "rb": "ruby",
+            "cpp": "cpp",
+            "c": "c",
+            "sh": "bash",
+        }.get(ext, ext)
+        parts.append(f"### {f['path']}\n```{lang}\n{f['content']}\n```\n")
+
+    parts.append("## Automated Regex Findings (already confirmed, do not repeat)\n")
+    parts.append(f"```json\n{regex_findings_json}\n```\n")
+
+    if memories_json:
+        parts.append("## Memory Context (prior decisions and architecture)\n")
+        parts.append(f"```json\n{memories_json}\n```\n")
+
+    if focus_areas:
+        parts.append(f"## Focus Areas\nPrioritize: {focus_areas}\n")
+
+    parts.append(
+        "Now perform your adversarial review of these source files. "
+        "Focus on what the regex missed. "
+        "Return ONLY the JSON structure specified in your instructions."
+    )
+
+    return "\n".join(parts)

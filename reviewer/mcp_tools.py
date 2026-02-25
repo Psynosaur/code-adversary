@@ -13,6 +13,7 @@ from fastmcp import Context, FastMCP
 from reviewer.analyzer import (
     challenge_decision as _challenge_decision,
     review_diff as _review_diff,
+    review_files as _review_files,
     review_pattern as _review_pattern,
 )
 from reviewer.config import PERSONA, PERSONA_TRAITS
@@ -36,10 +37,11 @@ def _error_response(tool_name: str, error: Exception) -> str:
 
 
 def _make_progress_bridge(ctx: Context, loop: asyncio.AbstractEventLoop):
-    """Create a sync callback that sends MCP progress notifications.
+    """Create a sync callback that sends MCP log notifications during streaming.
 
-    The callback is called from the blocking LLM streaming thread.
-    It uses run_coroutine_threadsafe to bridge to the async MCP context.
+    Uses ctx.log (not ctx.report_progress) because log notifications are
+    unconditional — they don't require the client to have sent a progressToken.
+    This keeps the SSE connection alive during long-running Bedrock inference.
     """
     call_count = 0
 
@@ -48,17 +50,16 @@ def _make_progress_bridge(ctx: Context, loop: asyncio.AbstractEventLoop):
         call_count += 1
         try:
             future = asyncio.run_coroutine_threadsafe(
-                ctx.report_progress(
-                    progress=chars_so_far,
-                    total=None,
-                    message=message,
+                ctx.log(
+                    message=f"[review] {message}",
+                    level="info",
+                    logger_name="reviewer.llm",
                 ),
                 loop,
             )
-            # Don't block long -- just fire and forget with a short timeout
-            future.result(timeout=1.0)
-        except Exception:
-            pass  # Never let progress errors kill the review
+            future.result(timeout=2.0)
+        except Exception as e:
+            logger.warning("Log notification failed (call #%d): %s", call_count, e)
 
     return on_progress
 
@@ -162,6 +163,70 @@ def register_tools(mcp: FastMCP) -> None:
             return report.to_json()
         except Exception as e:
             return _error_response("challenge_decision", e)
+
+    @mcp.tool()
+    async def review_files(
+        file_paths: str,
+        file_contents: str,
+        ctx: Context,
+        memories: Optional[str] = None,
+        focus_areas: Optional[str] = None,
+    ) -> str:
+        """Adversarial review of source files (not diffs).
+
+        Reviews complete source files for bugs, design flaws, security issues,
+        and other problems. Use this for auditing existing code rather than
+        reviewing changes.
+
+        Args:
+            file_paths: JSON array of file paths (e.g., '["src/main.py", "src/utils.py"]')
+            file_contents: JSON array of file contents, parallel to file_paths
+            memories: Optional JSON string of recent memory objects for context
+            focus_areas: Optional comma-separated areas to focus on
+                         (e.g., "security,error_handling,correctness")
+        """
+        try:
+            paths = json.loads(file_paths)
+            contents = json.loads(file_contents)
+
+            if not isinstance(paths, list) or not isinstance(contents, list):
+                return json.dumps(
+                    {
+                        "verdict": "ERROR",
+                        "summary": "file_paths and file_contents must be JSON arrays",
+                        "stats": {
+                            "critical": 0,
+                            "warnings": 0,
+                            "suggestions": 0,
+                            "total": 0,
+                        },
+                        "findings": [],
+                        "error": "Invalid input: expected JSON arrays",
+                    },
+                    indent=2,
+                )
+
+            loop = asyncio.get_running_loop()
+            on_progress = _make_progress_bridge(ctx, loop)
+
+            report = await asyncio.to_thread(
+                _review_files,
+                file_paths=paths,
+                file_contents=contents,
+                memories_json=memories,
+                focus_areas=focus_areas,
+                on_progress=on_progress,
+            )
+            return report.to_json()
+        except json.JSONDecodeError as e:
+            return _error_response(
+                "review_files",
+                ValueError(
+                    f"file_paths and file_contents must be valid JSON arrays: {e}"
+                ),
+            )
+        except Exception as e:
+            return _error_response("review_files", e)
 
     @mcp.tool()
     def get_persona() -> str:

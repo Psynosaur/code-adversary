@@ -37,8 +37,9 @@ Severity levels:
 
 | Tool | Args | Description |
 |------|------|-------------|
-| `review_diff` | `diff` (str), `memories` (str, optional), `focus_areas` (str, optional) | Main review tool. Two-pass: regex + LLM adversarial analysis. |
-| `review_pattern` | `pattern_description` (str), `code_snippet` (str) | Scrutinize a specific code pattern. Two-pass: regex + LLM. |
+| `review_diff` | `diff` (str), `memories` (str, optional), `focus_areas` (str, optional) | Main review tool. Two-pass: regex + LLM adversarial analysis of a unified diff. |
+| `review_files` | `file_paths` (JSON array str), `file_contents` (JSON array str), `memories` (str, optional), `focus_areas` (str, optional) | Adversarial review of complete source files (not diffs). Same two-pass approach. Use for auditing existing code. |
+| `review_pattern` | `pattern_description` (str), `code_snippet` (str) | Scrutinize a specific code pattern against best practices. Two-pass: regex + LLM. |
 | `challenge_decision` | `decision` (str), `reasoning` (str), `alternatives` (str, optional) | LLM-powered adversarial challenge of an architectural decision. |
 | `get_persona` | -- | Returns the reviewer persona and behavioral traits. |
 
@@ -66,8 +67,12 @@ code-advesary/
     __init__.py
     config.py            # Persona, anti-patterns, Bedrock config, server config
     models.py            # Severity, Category enums, ReviewFinding, ReviewReport
-    mcp_tools.py         # MCP tool definitions
-    analyzer.py          # Two-pass: regex first, then LLM. Diff parser, structural checks
+    mcp_tools.py         # 5 MCP tool definitions + progress bridge
+    analyzer.py          # Orchestrator: review_diff, review_files, review_pattern, challenge_decision
+    diff_parser.py       # DiffHunk, DiffFile dataclasses, parse_diff(), diff_stats()
+    chunking.py          # Diff and source file chunking for LLM context windows
+    checks.py            # 19 regex anti-patterns + structural checks
+    llm_parsing.py       # LLM JSON response parsing + partial-response salvage
     llm.py               # Bedrock client (boto3 Session, AWS profile), token usage logging
     prompts.py           # Adversarial system prompts and message builders
   pyproject.toml
@@ -117,11 +122,14 @@ Add to your `opencode.json` (global or project-level):
     "code-reviewer": {
       "type": "remote",
       "url": "http://localhost:8088/mcp",
-      "enabled": true
+      "enabled": true,
+      "timeout": 300000
     }
   }
 }
 ```
+
+The `timeout` is set to 5 minutes (300000ms) because Bedrock LLM inference can take 60-90 seconds per chunk. Without it, OpenCode's default timeout will kill the tool call before the review completes.
 
 ## OpenCode plugin integration
 
@@ -214,6 +222,21 @@ Use the code-reviewer review_pattern tool with:
 - pattern_description: "Exponential backoff retry for HTTP requests"
 - code_snippet: <the code>
 ```
+
+### review_files
+
+Audit existing source files without needing a diff. Pass file paths and contents as parallel JSON arrays.
+
+```
+Review these files for security issues and design flaws.
+
+Use the code-reviewer review_files tool with:
+- file_paths: '["src/auth.py", "src/database.py"]'
+- file_contents: '["<contents of auth.py>", "<contents of database.py>"]'
+- focus_areas: "security,error_handling"
+```
+
+Returns the same JSON report format as `review_diff`.
 
 ### challenge_decision
 

@@ -215,3 +215,6 @@ __marimo__/
 # Streamlit
 .streamlit/secrets.toml
 data/
+
+# Audit logs (full LLM prompts/responses — large, sensitive)
+audit/

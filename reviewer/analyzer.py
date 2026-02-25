@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+from dataclasses import replace
 from typing import Optional
 
 from reviewer.checks import (
@@ -24,7 +25,7 @@ from reviewer.checks import (
     match_anti_patterns,
 )
 from reviewer.chunking import chunk_files, reconstruct_diff
-from reviewer.config import DEFAULT_FOCUS_AREAS
+from reviewer.config import DEFAULT_FOCUS_AREAS, DIFF_CHUNK_MAX_CHARS
 from reviewer.diff_parser import diff_stats, parse_diff
 from reviewer.llm_parsing import parse_llm_findings, parse_llm_summary
 from reviewer.models import (
@@ -38,9 +39,11 @@ from reviewer.llm import ProgressCallback
 from reviewer.prompts import (
     REVIEW_DIFF_SYSTEM,
     REVIEW_PATTERN_SYSTEM,
+    REVIEW_FILES_SYSTEM,
     CHALLENGE_DECISION_SYSTEM,
     build_review_diff_message,
     build_review_pattern_message,
+    build_review_files_message,
     build_challenge_decision_message,
 )
 
@@ -107,6 +110,7 @@ def review_diff(
     # ── PASS 2: LLM adversarial analysis (deep reasoning, chunked) ─────
     llm_findings: list[ReviewFinding] = []
     llm_summaries: list[str] = []
+    llm_chunk_failures = 0
 
     # Chunk files to keep each LLM call within token limits
     chunks = chunk_files(files)
@@ -171,12 +175,13 @@ def review_diff(
                 llm_summaries.append(chunk_summary)
 
         except RuntimeError as e:
+            llm_chunk_failures += 1
             logger.error(
                 "LLM pass failed for chunk %d/%d: %s", chunk_idx + 1, num_chunks, e
             )
             llm_findings.append(
                 ReviewFinding(
-                    severity=Severity.SUGGESTION,
+                    severity=Severity.WARNING,
                     category=Category.CORRECTNESS,
                     title="LLM review unavailable for chunk",
                     description=(
@@ -188,6 +193,21 @@ def review_diff(
             )
 
     llm_summary = " ".join(llm_summaries)
+
+    # Surface total LLM failure if all chunks failed
+    if llm_chunk_failures == num_chunks and num_chunks > 0:
+        llm_findings.append(
+            ReviewFinding(
+                severity=Severity.WARNING,
+                category=Category.CORRECTNESS,
+                title="LLM analysis completely unavailable",
+                description=(
+                    f"All {num_chunks} LLM chunk(s) failed. "
+                    f"Review contains regex-based findings only — "
+                    f"deep analysis (logic errors, edge cases, design issues) was not performed."
+                ),
+            )
+        )
 
     # ── Merge findings ───────────────────────────────────────────────────
     all_findings = regex_findings + llm_findings
@@ -309,6 +329,274 @@ def review_pattern(
         summary += f" LLM: {llm_summary}"
 
     return ReviewReport(findings=all_findings, summary=summary)
+
+
+def review_files(
+    file_paths: list[str],
+    file_contents: list[str],
+    memories_json: Optional[str] = None,
+    focus_areas: Optional[str] = None,
+    on_progress: ProgressCallback | None = None,
+) -> ReviewReport:
+    """
+    Review source files in their entirety — regex first pass, then LLM analysis.
+
+    Unlike review_diff, this reviews full source code rather than changes.
+    Useful for auditing existing code, onboarding to a codebase, or reviewing
+    files that weren't part of a recent diff.
+
+    Args:
+        file_paths: List of file paths (for context/reporting).
+        file_contents: List of file contents (parallel to file_paths).
+        memories_json: Optional JSON string of recent memory objects.
+        focus_areas: Optional comma-separated focus areas to prioritize.
+        on_progress: Optional callback for streaming progress updates.
+    """
+    if not file_paths or not file_contents:
+        return ReviewReport(summary="No files provided for review.")
+
+    if len(file_paths) != len(file_contents):
+        return ReviewReport(
+            summary=f"Mismatch: {len(file_paths)} paths but {len(file_contents)} contents."
+        )
+
+    # Build file descriptors
+    files = [
+        {"path": path, "content": content}
+        for path, content in zip(file_paths, file_contents)
+    ]
+
+    # Parse memories if provided
+    memories: list[dict] = []
+    if memories_json:
+        try:
+            parsed = json.loads(memories_json)
+            if isinstance(parsed, list):
+                memories = parsed
+            elif isinstance(parsed, dict) and "data" in parsed:
+                memories = parsed["data"]
+        except (json.JSONDecodeError, TypeError):
+            pass
+
+    # Parse focus areas
+    active_focus = DEFAULT_FOCUS_AREAS
+    if focus_areas:
+        active_focus = [a.strip().lower() for a in focus_areas.split(",")]
+
+    # ── PASS 1: Regex checks on each file ────────────────────────────────
+    regex_findings: list[ReviewFinding] = []
+    total_lines = 0
+
+    for f in files:
+        lines = f["content"].splitlines()
+        total_lines += len(lines)
+        path = f["path"]
+
+        # Use dataclasses.replace to avoid mutating objects returned by
+        # check functions — they may share instances across calls.
+        for check_fn, check_arg in [
+            (check_snippet_anti_patterns, f["content"]),
+            (check_snippet_nesting, lines),
+            (check_snippet_length, lines),
+            (check_snippet_repeated_calls, lines),
+            (check_snippet_hardcoded_numerics, lines),
+            (check_snippet_mixed_io, lines),
+        ]:
+            for finding in check_fn(check_arg):
+                regex_findings.append(replace(finding, file_path=path))
+
+    # ── PASS 2: LLM adversarial analysis (chunked by file) ──────────────
+    llm_findings: list[ReviewFinding] = []
+    llm_summaries: list[str] = []
+    llm_chunk_failures = 0
+
+    # Chunk files to stay within token limits
+    chunks = _chunk_source_files(files)
+    num_chunks = len(chunks)
+
+    if num_chunks > 1:
+        logger.info(
+            "Source files split into %d chunks for LLM review (%d files total)",
+            num_chunks,
+            len(files),
+        )
+
+    for chunk_idx, chunk_files_list in enumerate(chunks):
+        try:
+            # Regex findings relevant to this chunk
+            chunk_paths = {f["path"] for f in chunk_files_list}
+            chunk_regex = [
+                f
+                for f in regex_findings
+                if f.file_path is None or f.file_path in chunk_paths
+            ]
+            chunk_regex_json = json.dumps([f.to_dict() for f in chunk_regex], indent=2)
+
+            user_message = build_review_files_message(
+                files=chunk_files_list,
+                regex_findings_json=chunk_regex_json,
+                memories_json=memories_json,
+                focus_areas=focus_areas,
+            )
+
+            tool_label = (
+                f"review_files[{chunk_idx + 1}/{num_chunks}]"
+                if num_chunks > 1
+                else "review_files"
+            )
+            chunk_file_names = ", ".join(f["path"] for f in chunk_files_list)
+            chunk_chars = sum(len(f["content"]) for f in chunk_files_list)
+            logger.info(
+                "LLM chunk %d/%d: files=[%s] (~%d chars)",
+                chunk_idx + 1,
+                num_chunks,
+                chunk_file_names,
+                chunk_chars,
+            )
+
+            response = llm.invoke(
+                system_prompt=REVIEW_FILES_SYSTEM,
+                user_message=user_message,
+                tool=tool_label,
+                on_progress=on_progress,
+            )
+            response_text, stop_reason = response
+            was_truncated = stop_reason == "max_tokens"
+            chunk_findings = parse_llm_findings(
+                response_text, was_truncated=was_truncated
+            )
+            chunk_summary = parse_llm_summary(response_text)
+
+            llm_findings.extend(chunk_findings)
+            if chunk_summary:
+                llm_summaries.append(chunk_summary)
+
+        except RuntimeError as e:
+            llm_chunk_failures += 1
+            logger.error(
+                "LLM pass failed for chunk %d/%d: %s", chunk_idx + 1, num_chunks, e
+            )
+            llm_findings.append(
+                ReviewFinding(
+                    severity=Severity.WARNING,
+                    category=Category.CORRECTNESS,
+                    title="LLM review unavailable for chunk",
+                    description=(
+                        f"Bedrock inference failed for files: "
+                        f"{', '.join(f['path'] for f in chunk_files_list)}. "
+                        f"Error: {e}. Showing regex-only results for these files."
+                    ),
+                )
+            )
+
+    llm_summary = " ".join(llm_summaries)
+
+    # Surface total LLM failure if all chunks failed
+    if llm_chunk_failures == num_chunks and num_chunks > 0:
+        llm_findings.append(
+            ReviewFinding(
+                severity=Severity.WARNING,
+                category=Category.CORRECTNESS,
+                title="LLM analysis completely unavailable",
+                description=(
+                    f"All {num_chunks} LLM chunk(s) failed. "
+                    f"Review contains regex-based findings only — "
+                    f"deep analysis (logic errors, edge cases, design issues) was not performed."
+                ),
+            )
+        )
+
+    # ── Merge findings ───────────────────────────────────────────────────
+    all_findings = regex_findings + llm_findings
+
+    # Filter by focus areas if specified
+    if focus_areas:
+        all_findings = [
+            f
+            for f in all_findings
+            if str(f.category) in active_focus or str(f.severity) == "critical"
+        ]
+
+    # Sort: critical first, then warnings, then suggestions
+    severity_order = {Severity.CRITICAL: 0, Severity.WARNING: 1, Severity.SUGGESTION: 2}
+    all_findings.sort(key=lambda f: severity_order.get(f.severity, 99))
+
+    # Build summary
+    summary_parts = [
+        f"Reviewed {len(files)} file(s), {total_lines} total lines.",
+    ]
+    if all_findings:
+        crits = sum(1 for f in all_findings if f.severity == Severity.CRITICAL)
+        warns = sum(1 for f in all_findings if f.severity == Severity.WARNING)
+        suggs = sum(1 for f in all_findings if f.severity == Severity.SUGGESTION)
+        parts = []
+        if crits:
+            parts.append(f"{crits} critical")
+        if warns:
+            parts.append(f"{warns} warning(s)")
+        if suggs:
+            parts.append(f"{suggs} suggestion(s)")
+        summary_parts.append(f"Found {', '.join(parts)}.")
+    else:
+        summary_parts.append("No issues detected.")
+
+    summary_parts.append(
+        f"[Regex: {len(regex_findings)} findings, LLM: {len(llm_findings)} findings"
+        + (f", {num_chunks} chunks" if num_chunks > 1 else "")
+        + "]"
+    )
+
+    if llm_summary:
+        summary_parts.append(f"LLM assessment: {llm_summary}")
+
+    if memories:
+        summary_parts.append(
+            f"Cross-referenced against {len(memories)} memory entries."
+        )
+
+    return ReviewReport(
+        findings=all_findings,
+        summary=" ".join(summary_parts),
+        diff_stats={
+            "files_changed": len(files),
+            "lines_added": total_lines,
+            "lines_removed": 0,
+        },
+        memory_context_used=bool(memories),
+    )
+
+
+def _chunk_source_files(
+    files: list[dict[str, str]],
+) -> list[list[dict[str, str]]]:
+    """Split source files into chunks that fit within token limits.
+
+    Each chunk contains one or more files. Oversized single files
+    get their own chunk (the LLM will handle truncation).
+    """
+    if not files:
+        return []
+
+    max_chars = DIFF_CHUNK_MAX_CHARS
+    chunks: list[list[dict[str, str]]] = []
+    current_chunk: list[dict[str, str]] = []
+    current_chars = 0
+
+    for f in files:
+        file_chars = len(f["content"]) + 200  # overhead for path/formatting
+
+        if current_chunk and (current_chars + file_chars) > max_chars:
+            chunks.append(current_chunk)
+            current_chunk = [f]
+            current_chars = file_chars
+        else:
+            current_chunk.append(f)
+            current_chars += file_chars
+
+    if current_chunk:
+        chunks.append(current_chunk)
+
+    return chunks
 
 
 def challenge_decision(

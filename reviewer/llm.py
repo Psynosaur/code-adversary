@@ -18,6 +18,7 @@ from reviewer.config import (
     BEDROCK_REGION,
     BEDROCK_MAX_TOKENS,
     USAGE_LOG_PATH,
+    AUDIT_LOG_DIR,
 )
 
 logger = logging.getLogger(__name__)
@@ -99,6 +100,75 @@ def _log_usage(
     )
 
 
+# ── Audit log ────────────────────────────────────────────────────────────────
+
+
+def _write_audit(
+    tool: str,
+    system_prompt: str,
+    user_message: str,
+    response_text: str,
+    stop_reason: str,
+    input_tokens: int,
+    output_tokens: int,
+    latency_ms: int,
+    temperature: float,
+    max_tokens: int,
+    error: str | None = None,
+) -> None:
+    """Write a JSON audit file for a single LLM invocation.
+
+    One file per call: audit/{timestamp}_{tool}.json
+    Captures full prompts and responses for post-hoc inspection.
+    """
+    audit_dir = Path(AUDIT_LOG_DIR)
+    try:
+        audit_dir.mkdir(parents=True, exist_ok=True)
+    except OSError as e:
+        logger.warning("Cannot create audit dir %s: %s", audit_dir, e)
+        return
+
+    ts = datetime.now(timezone.utc)
+    # Filename: 20260225T135050Z_review_files.json (safe chars only)
+    safe_tool = tool.replace("/", "_").replace("[", "_").replace("]", "")
+    filename = f"{ts.strftime('%Y%m%dT%H%M%SZ')}_{safe_tool}.json"
+
+    record = {
+        "timestamp": ts.isoformat(),
+        "tool": tool,
+        "model": BEDROCK_MODEL_ID,
+        "parameters": {
+            "max_tokens": max_tokens,
+            "temperature": temperature,
+        },
+        "input": {
+            "system_prompt": system_prompt,
+            "user_message": user_message,
+        },
+        "output": {
+            "response_text": response_text,
+            "stop_reason": stop_reason,
+        },
+        "usage": {
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens,
+            "total_tokens": input_tokens + output_tokens,
+        },
+        "latency_ms": latency_ms,
+    }
+    if error:
+        record["error"] = error
+
+    try:
+        (audit_dir / filename).write_text(
+            json.dumps(record, indent=2, ensure_ascii=False),
+            encoding="utf-8",
+        )
+        logger.debug("Audit log written: %s", filename)
+    except OSError as e:
+        logger.warning("Failed to write audit log %s: %s", filename, e)
+
+
 # ── Bedrock client ───────────────────────────────────────────────────────────
 
 
@@ -174,6 +244,13 @@ def invoke(
     start = time.monotonic()
     logger.info("Bedrock stream starting [%s] model=%s", tool, BEDROCK_MODEL_ID)
 
+    # Notify caller that we're about to wait for Bedrock TTFT
+    if on_progress:
+        try:
+            on_progress(0, 0.0, f"waiting for Bedrock ({tool})...")
+        except Exception as cb_err:
+            logger.warning("on_progress callback raised on pre-inference: %s", cb_err)
+
     # Declare outside try so partial results are accessible in except
     text_chunks: list[str] = []
     input_tokens = 0
@@ -191,6 +268,7 @@ def invoke(
         stop_reason = "unknown"
         chunk_count = 0
         total_chars = 0  # Running counter -- avoids O(n^2) recounting
+        first_token_reported = False
 
         for event in response["body"]:
             # Guard against non-chunk events (error events, etc.)
@@ -230,6 +308,19 @@ def invoke(
                     text_chunks.append(text)
                     total_chars += len(text)
                     chunk_count += 1
+
+                    # Report first token arrival (TTFT)
+                    if not first_token_reported and on_progress:
+                        first_token_reported = True
+                        elapsed = time.monotonic() - start
+                        msg = f"first token after {elapsed:.1f}s, streaming..."
+                        logger.info("  [%s] %s", tool, msg)
+                        try:
+                            on_progress(total_chars, elapsed, msg)
+                        except Exception as cb_err:
+                            logger.warning(
+                                "on_progress callback raised on first token: %s", cb_err
+                            )
 
                     # Log and report progress every 20 chunks
                     if chunk_count % 20 == 0:
@@ -285,6 +376,19 @@ def invoke(
             latency_ms=latency_ms,
         )
 
+        _write_audit(
+            tool=tool,
+            system_prompt=system_prompt,
+            user_message=user_message,
+            response_text=full_text,
+            stop_reason=stop_reason,
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            latency_ms=latency_ms,
+            temperature=temperature,
+            max_tokens=max_tokens,
+        )
+
         if stop_reason == "max_tokens":
             logger.warning(
                 "Response truncated (hit max_tokens=%d) for tool=%s. "
@@ -318,6 +422,32 @@ def invoke(
                 output_tokens=output_tokens,
                 latency_ms=latency_ms,
             )
+            _write_audit(
+                tool=tool,
+                system_prompt=system_prompt,
+                user_message=user_message,
+                response_text=partial,
+                stop_reason="stream_error",
+                input_tokens=input_tokens,
+                output_tokens=output_tokens,
+                latency_ms=latency_ms,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                error=str(e),
+            )
             return partial, "stream_error"
         logger.error("Bedrock inference failed after %dms: %s", latency_ms, e)
+        _write_audit(
+            tool=tool,
+            system_prompt=system_prompt,
+            user_message=user_message,
+            response_text="",
+            stop_reason="error",
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            latency_ms=latency_ms,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            error=str(e),
+        )
         raise RuntimeError(f"Bedrock inference failed: {e}") from e
