@@ -1,0 +1,4 @@
+fastmcp>=2.0.0
+uvicorn>=0.34.0
+sse-starlette>=2.2.1
+boto3>=1.35.0

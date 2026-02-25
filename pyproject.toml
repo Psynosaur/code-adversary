@@ -1,0 +1,18 @@
+[build-system]
+requires = ["setuptools>=75.0", "wheel"]
+build-backend = "setuptools.backends._legacy:_Backend"
+
+[project]
+name = "code-reviewer-mcp"
+version = "0.2.0"
+description = "Adversarial code reviewer MCP server with LLM-powered analysis"
+requires-python = ">=3.12"
+dependencies = [
+    "fastmcp>=2.0.0",
+    "uvicorn>=0.34.0",
+    "sse-starlette>=2.2.1",
+    "boto3>=1.35.0",
+]
+
+[project.scripts]
+code-reviewer-mcp = "server:main"
