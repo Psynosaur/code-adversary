@@ -105,8 +105,8 @@ def _log_usage(
 
 def _write_audit(
     tool: str,
-    system_prompt: str,
-    user_message: str,
+    system_prompt: list[dict] | str,
+    user_message: list[dict] | str,
     response_text: str,
     stop_reason: str,
     input_tokens: int,
@@ -114,6 +114,8 @@ def _write_audit(
     latency_ms: int,
     temperature: float,
     max_tokens: int,
+    cache_read_input_tokens: int = 0,
+    cache_creation_input_tokens: int = 0,
     error: str | None = None,
 ) -> None:
     """Write a JSON audit file for a single LLM invocation.
@@ -153,6 +155,8 @@ def _write_audit(
             "input_tokens": input_tokens,
             "output_tokens": output_tokens,
             "total_tokens": input_tokens + output_tokens,
+            "cache_read_input_tokens": cache_read_input_tokens,
+            "cache_creation_input_tokens": cache_creation_input_tokens,
         },
         "latency_ms": latency_ms,
     }
@@ -184,7 +188,7 @@ def _get_client():
             "bedrock-runtime",
             config=BotoConfig(
                 retries={"max_attempts": 2, "mode": "adaptive"},
-                read_timeout=120,
+                read_timeout=300,
                 connect_timeout=10,
                 max_pool_connections=4,
                 tcp_keepalive=True,
@@ -200,8 +204,8 @@ def _get_client():
 
 
 def invoke(
-    system_prompt: str,
-    user_message: str,
+    system_prompt: list[dict] | str,
+    user_message: list[dict] | str,
     tool: str = "unknown",
     max_tokens: int = BEDROCK_MAX_TOKENS,
     temperature: float = 0.3,
@@ -214,8 +218,10 @@ def invoke(
     operator can see the review forming in real time.
 
     Args:
-        system_prompt: The system/persona prompt
-        user_message: The user message (diff, code, decision, etc.)
+        system_prompt: The system/persona prompt — either a plain string
+            (auto-wrapped) or a list of Bedrock content blocks for caching.
+        user_message: The user message — either a plain string (auto-wrapped)
+            or a list of Bedrock content blocks.
         tool: Name of the calling tool (for usage logging)
         max_tokens: Maximum tokens in the response
         temperature: Sampling temperature (lower = more focused)
@@ -231,13 +237,25 @@ def invoke(
     """
     client = _get_client()
 
+    # Normalise system prompt to content-block array
+    if isinstance(system_prompt, str):
+        system_blocks = [{"type": "text", "text": system_prompt}]
+    else:
+        system_blocks = system_prompt
+
+    # Normalise user message to content-block array
+    if isinstance(user_message, str):
+        user_blocks = [{"type": "text", "text": user_message}]
+    else:
+        user_blocks = user_message
+
     body = {
         "anthropic_version": "bedrock-2023-05-31",
         "max_tokens": max_tokens,
         "temperature": temperature,
-        "system": system_prompt,
+        "system": system_blocks,
         "messages": [
-            {"role": "user", "content": user_message},
+            {"role": "user", "content": user_blocks},
         ],
     }
 
@@ -255,6 +273,8 @@ def invoke(
     text_chunks: list[str] = []
     input_tokens = 0
     output_tokens = 0
+    cache_read_input_tokens = 0
+    cache_creation_input_tokens = 0
 
     try:
         response = client.invoke_model_with_response_stream(
@@ -341,8 +361,11 @@ def invoke(
                 output_tokens = chunk.get("usage", {}).get("output_tokens", 0)
 
             elif chunk_type == "message_start":
-                input_tokens = (
-                    chunk.get("message", {}).get("usage", {}).get("input_tokens", 0)
+                usage = chunk.get("message", {}).get("usage", {})
+                input_tokens = usage.get("input_tokens", 0)
+                cache_read_input_tokens = usage.get("cache_read_input_tokens", 0)
+                cache_creation_input_tokens = usage.get(
+                    "cache_creation_input_tokens", 0
                 )
 
         full_text = "".join(text_chunks)
@@ -376,10 +399,18 @@ def invoke(
             latency_ms=latency_ms,
         )
 
+        if cache_read_input_tokens or cache_creation_input_tokens:
+            logger.info(
+                "Prompt cache [%s]: read=%d write=%d",
+                tool,
+                cache_read_input_tokens,
+                cache_creation_input_tokens,
+            )
+
         _write_audit(
             tool=tool,
-            system_prompt=system_prompt,
-            user_message=user_message,
+            system_prompt=system_blocks,
+            user_message=user_blocks,
             response_text=full_text,
             stop_reason=stop_reason,
             input_tokens=input_tokens,
@@ -387,6 +418,8 @@ def invoke(
             latency_ms=latency_ms,
             temperature=temperature,
             max_tokens=max_tokens,
+            cache_read_input_tokens=cache_read_input_tokens,
+            cache_creation_input_tokens=cache_creation_input_tokens,
         )
 
         if stop_reason == "max_tokens":
@@ -433,14 +466,16 @@ def invoke(
                 latency_ms=latency_ms,
                 temperature=temperature,
                 max_tokens=max_tokens,
+                cache_read_input_tokens=cache_read_input_tokens,
+                cache_creation_input_tokens=cache_creation_input_tokens,
                 error=str(e),
             )
             return partial, "stream_error"
         logger.error("Bedrock inference failed after %dms: %s", latency_ms, e)
         _write_audit(
             tool=tool,
-            system_prompt=system_prompt,
-            user_message=user_message,
+            system_prompt=system_blocks,
+            user_message=user_blocks,
             response_text="",
             stop_reason="error",
             input_tokens=input_tokens,
@@ -448,6 +483,8 @@ def invoke(
             latency_ms=latency_ms,
             temperature=temperature,
             max_tokens=max_tokens,
+            cache_read_input_tokens=cache_read_input_tokens,
+            cache_creation_input_tokens=cache_creation_input_tokens,
             error=str(e),
         )
         raise RuntimeError(f"Bedrock inference failed: {e}") from e

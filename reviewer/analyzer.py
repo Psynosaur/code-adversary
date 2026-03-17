@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re as _re
 from dataclasses import replace
 from typing import Optional
 
@@ -48,6 +49,22 @@ from reviewer.prompts import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+# ── Source content minification ───────────────────────────────────────────────
+
+# Precompiled pattern for minification
+_TRAILING_WS_RE = _re.compile(r"[ \t]+$", _re.MULTILINE)
+
+
+def _minify_source(content: str) -> str:
+    """Strip trailing whitespace from every line to reduce token count.
+
+    Line numbers are preserved — only trailing spaces/tabs are removed.
+    CRLF line endings are normalised to LF first.
+    """
+    result = content.replace("\r\n", "\n").replace("\r", "\n")
+    return _TRAILING_WS_RE.sub("", result)
 
 
 # ── Main Review Functions ────────────────────────────────────────────────────
@@ -132,7 +149,7 @@ def review_diff(
                 for f in regex_findings
                 if f.file_path is None or f.file_path in chunk_paths
             ]
-            chunk_regex_json = json.dumps([f.to_dict() for f in chunk_regex], indent=2)
+            chunk_regex_dicts = [f.to_dict() for f in chunk_regex]
 
             # Reconstruct diff for just this chunk
             chunk_diff = reconstruct_diff(chunk_file_list)
@@ -140,7 +157,7 @@ def review_diff(
 
             user_message = build_review_diff_message(
                 diff_text=chunk_diff,
-                regex_findings_json=chunk_regex_json,
+                regex_findings=chunk_regex_dicts,
                 memories_json=memories_json,
             )
 
@@ -296,13 +313,11 @@ def review_pattern(
     llm_summary = ""
 
     try:
-        regex_findings_json = json.dumps(
-            [f.to_dict() for f in regex_findings], indent=2
-        )
+        regex_findings_dicts = [f.to_dict() for f in regex_findings]
         user_message = build_review_pattern_message(
             pattern_description=pattern_description,
             code_snippet=code_snippet,
-            regex_findings_json=regex_findings_json,
+            regex_findings=regex_findings_dicts,
         )
         response = llm.invoke(
             system_prompt=REVIEW_PATTERN_SYSTEM,
@@ -366,6 +381,12 @@ def review_files(
         for path, content in zip(file_paths, file_contents)
     ]
 
+    # Build minified copies for LLM input (saves tokens on whitespace)
+    # Regex checks run on original content for accurate line numbers.
+    llm_files = [
+        {"path": f["path"], "content": _minify_source(f["content"])} for f in files
+    ]
+
     # Parse memories if provided
     memories: list[dict] = []
     if memories_json:
@@ -410,8 +431,8 @@ def review_files(
     llm_summaries: list[str] = []
     llm_chunk_failures = 0
 
-    # Chunk files to stay within token limits
-    chunks = _chunk_source_files(files)
+    # Chunk minified files for LLM input (original files used for regex above)
+    chunks = _chunk_source_files(llm_files)
     num_chunks = len(chunks)
 
     if num_chunks > 1:
@@ -430,11 +451,11 @@ def review_files(
                 for f in regex_findings
                 if f.file_path is None or f.file_path in chunk_paths
             ]
-            chunk_regex_json = json.dumps([f.to_dict() for f in chunk_regex], indent=2)
+            chunk_regex_dicts = [f.to_dict() for f in chunk_regex]
 
             user_message = build_review_files_message(
                 files=chunk_files_list,
-                regex_findings_json=chunk_regex_json,
+                regex_findings=chunk_regex_dicts,
                 memories_json=memories_json,
                 focus_areas=focus_areas,
             )
